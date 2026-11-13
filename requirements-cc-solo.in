@@ -1,0 +1,14 @@
+# dlt runtime is installed from this source tree. Lock includes transitive runtime deps.
+hatchling
+editables
+pytest>=7.4.4,<8
+pytest-asyncio>=0.23.5,<0.24
+pytest-mock
+pytest-timeout
+pytest-console-scripts
+pytest-cases
+requests-mock
+duckdb<2
+pyarrow>=16
+pandas==2.3.3
+ruff>=0.3.2,<0.4
