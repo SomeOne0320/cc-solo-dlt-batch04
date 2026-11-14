@@ -30,6 +30,37 @@ if TYPE_CHECKING:
     from dlt.extract.incremental import Incremental
 
 
+class IncrementalRunState:
+    """Cursor progress shared by all transforms used within a single incremental run.
+
+    A resource may yield plain rows on one page and an Arrow/pandas batch on the next. Each
+    item type gets its own transform, but all of them must observe and advance the same cursor.
+    Keeping the progress here prevents a transform created on a later page from falling back to
+    the run start value and moving the saved cursor backwards.
+
+    The state used to filter already processed data (the run start value and the hashes of rows
+    already loaded at that boundary) is pinned here when the run starts and never follows the
+    cursor as it advances.
+    """
+
+    def __init__(
+        self,
+        start_value: Optional[TCursorValue],
+        unique_hashes: Set[str],
+    ) -> None:
+        self.start_value: Optional[TCursorValue] = start_value
+        # pinned: the filter for old data must look at the state from the start of the run
+        self.start_unique_hashes = set(unique_hashes)
+        self.start_hashes_legacy = has_legacy_dedup_hashes(unique_hashes)
+        # evolving: cursor and dedup state of the rows just processed
+        self.last_value: Optional[TCursorValue] = start_value
+        self.last_rows: List[TDataItem] = []
+        self.unique_hashes = set(unique_hashes)
+        self.unique_hashes_legacy = self.start_hashes_legacy
+        # tells if incremental instance has processed any data
+        self.seen_data = False
+
+
 class IncrementalTransform:
     """A base class for handling extraction and stateful tracking
     of incremental data from input data items.
@@ -55,32 +86,32 @@ class IncrementalTransform:
         lag: Optional[float] = None,
         range_start: TIncrementalRange = "closed",
         range_end: TIncrementalRange = "open",
+        run_state: Optional[IncrementalRunState] = None,
     ) -> None:
         self.resource_name = resource_name
         self.cursor_path = cursor_path
         self.initial_value = initial_value
-        self.start_value = start_value
+        # all transforms of a run share the cursor progress; a transform created outside of
+        # `Incremental` gets its own state seeded from the values passed here
+        self._run_state = (
+            run_state if run_state is not None else IncrementalRunState(start_value, unique_hashes)
+        )
         self.start_value_is_datetime = isinstance(start_value, datetime)
         # self.start_value_tz = start_value.tzinfo if isinstance(start_value, datetime) else None
-        self.last_value = start_value
         self.end_value = end_value
         self.end_value_is_datetime = isinstance(end_value, datetime)
+        # end_value is a per-instance configuration, adapted on this transform's first item
+        self._end_value_adapted = False
         # self.end_value = end_value.tzinfo if isinstance(end_value, datetime) else None
-        self.last_rows: List[TDataItem] = []
         self.last_value_func = last_value_func
-        self.unique_hashes = unique_hashes
-        self.start_unique_hashes = set(unique_hashes)
-        # hashes from before 1.29 keep their format until the set is rebuilt on a new last value
-        self.start_hashes_legacy = has_legacy_dedup_hashes(unique_hashes)
-        self.unique_hashes_legacy = self.start_hashes_legacy
+        # NOTE: self.start_unique_hashes and self.start_hashes_legacy are properties reading
+        # the run state pinned at the start of the run
         self.on_cursor_value_missing = on_cursor_value_missing
         self.lag = lag
         self.range_start = range_start
         self.range_end = range_end
         # NOTE: self.primary_key is a property
         self.primary_key = primary_key
-        # tells if incremental instance has processed any data
-        self.seen_data = False
 
         # compile jsonpath
         self._compiled_cursor_path = compile_path(cursor_path)
@@ -88,6 +119,62 @@ class IncrementalTransform:
         if simple_field_name := extract_simple_field_name(self._compiled_cursor_path):
             self.cursor_path = simple_field_name
             self._compiled_cursor_path = None
+
+    @property
+    def start_value(self) -> Optional[TCursorValue]:
+        return self._run_state.start_value
+
+    @start_value.setter
+    def start_value(self, value: Optional[TCursorValue]) -> None:
+        self._run_state.start_value = value
+
+    @property
+    def start_unique_hashes(self) -> Set[str]:
+        return self._run_state.start_unique_hashes
+
+    @property
+    def start_hashes_legacy(self) -> bool:
+        return self._run_state.start_hashes_legacy
+
+    @property
+    def last_value(self) -> Optional[TCursorValue]:
+        return self._run_state.last_value
+
+    @last_value.setter
+    def last_value(self, value: Optional[TCursorValue]) -> None:
+        self._run_state.last_value = value
+
+    @property
+    def last_rows(self) -> List[TDataItem]:
+        return self._run_state.last_rows
+
+    @last_rows.setter
+    def last_rows(self, value: List[TDataItem]) -> None:
+        self._run_state.last_rows = value
+
+    @property
+    def unique_hashes(self) -> Set[str]:
+        return self._run_state.unique_hashes
+
+    @unique_hashes.setter
+    def unique_hashes(self, value: Set[str]) -> None:
+        self._run_state.unique_hashes = value
+
+    @property
+    def unique_hashes_legacy(self) -> bool:
+        return self._run_state.unique_hashes_legacy
+
+    @unique_hashes_legacy.setter
+    def unique_hashes_legacy(self, value: bool) -> None:
+        self._run_state.unique_hashes_legacy = value
+
+    @property
+    def seen_data(self) -> bool:
+        return self._run_state.seen_data
+
+    @seen_data.setter
+    def seen_data(self, value: bool) -> None:
+        self._run_state.seen_data = value
 
     def compute_unique_value(
         self,
@@ -227,9 +314,10 @@ class JsonIncremental(IncrementalTransform):
                 return row, False, False
         last_value = self.last_value
         last_value_func = self.last_value_func
-        # correct tz-awareness if last_value/start_value not matching
+        # correct tz-awareness of the run start once, using the first row of the run. A
+        # transform created for a later page sees an already advanced cursor (run-level
+        # seen_data), so it must not adapt it again nor expect it to equal the start value.
         if not self.seen_data and self.start_value_is_datetime and isinstance(row_value, datetime):
-            # NOTE: we are making sure that last_value == start_value here (self.seen_data)
             assert self.last_value == self.start_value
             self.last_value = self.start_value = last_value = self._adapt_timezone(
                 row_value, last_value, "last_value", self.resource_name
@@ -240,10 +328,11 @@ class JsonIncremental(IncrementalTransform):
         if self.end_value is not None:
             # correct tz-awareness of end value
             if (
-                not self.seen_data
+                not self._end_value_adapted
                 and self.end_value_is_datetime
                 and isinstance(row_value, datetime)
             ):
+                self._end_value_adapted = True
                 self.end_value = self._adapt_timezone(
                     row_value, self.end_value, "end_value", self.resource_name
                 )
@@ -370,28 +459,36 @@ class ArrowIncremental(IncrementalTransform):
         return [self.compute_unique_value(row, self._primary_key, legacy) for row in rows]
 
     def compute_unique_values_with_index(
-        self, item: "TAnyArrowItem", unique_columns: List[str], legacy: bool = False
+        self,
+        item: "TAnyArrowItem",
+        unique_columns: List[str],
+        index_column: str,
+        legacy: bool = False,
     ) -> List[Tuple[Any, str]]:
         if not unique_columns:
             return []
-        indices = item[self._dlt_index].to_pylist()
+        indices = item[index_column].to_pylist()
         rows = item.select(unique_columns).to_pylist()
         return [
             (index, self.compute_unique_value(row, self._primary_key, legacy))
             for index, row in zip(indices, rows)
         ]
 
-    def _add_unique_index(self, tbl: "pa.Table") -> "pa.Table":
-        """Creates unique index if necessary."""
+    def _add_unique_index(self, tbl: "pa.Table") -> Tuple["pa.Table", str]:
+        """Creates a row index column and returns it with the column name used.
+
+        The index is always synthetic. Using a data column (ie. the primary key) as the index
+        would remove every row sharing that key, including rows at a newer cursor value.
+        """
         from dlt.common.libs import pyarrow
         from dlt.common.libs.pyarrow import pyarrow as pa
 
-        # create unique index if necessary
-        if self._dlt_index not in tbl.schema.names:
-            # indices = pa.compute.sequence(start=0, step=1, length=tbl.num_rows,
-            indices = pa.array(range(tbl.num_rows))
-            tbl = pyarrow.append_column(tbl, self._dlt_index, indices)
-        return tbl
+        index_column = self._dlt_index
+        # never reuse a column that is already in the data
+        while index_column in tbl.schema.names:
+            index_column = f"_{index_column}"
+        indices = pa.array(range(tbl.num_rows))
+        return pyarrow.append_column(tbl, index_column, indices), index_column
 
     def __call__(
         self,
@@ -422,9 +519,6 @@ class ArrowIncremental(IncrementalTransform):
             for pk in unique_columns:
                 if pk not in tbl.schema.names:
                     raise IncrementalPrimaryKeyMissing(self.resource_name, pk, tbl)
-            # use primary key as unique index
-            if isinstance(primary_key, str):
-                self._dlt_index = primary_key
         elif primary_key is None:
             unique_columns = tbl.schema.names
 
@@ -449,9 +543,10 @@ class ArrowIncremental(IncrementalTransform):
         # The new max/min value
         row_value_scalar = self.compute(tbl[cursor_path])
         row_value = from_arrow_scalar(row_value_scalar)
-        # correct tz-awareness
+        # correct tz-awareness of the run start once, using the first batch of the run. A
+        # transform created for a later page sees an already advanced cursor
+        # (run-level seen_data), so it must not adapt it again.
         if not self.seen_data and self.start_value_is_datetime and isinstance(row_value, datetime):
-            # NOTE: we are making sure that last_value == start_value here (self.seen_data)
             assert self.last_value == self.start_value
             self.start_value = self.last_value = self._adapt_timezone(
                 row_value, self.last_value, "last_value", self.resource_name
@@ -465,10 +560,11 @@ class ArrowIncremental(IncrementalTransform):
         if self.end_value is not None:
             # correct tz-awareness of end value
             if (
-                not self.seen_data
+                not self._end_value_adapted
                 and self.end_value_is_datetime
                 and isinstance(row_value, datetime)
             ):
+                self._end_value_adapted = True
                 self.end_value = self._adapt_timezone(
                     row_value, self.end_value, "end_value", self.resource_name
                 )
@@ -499,6 +595,7 @@ class ArrowIncremental(IncrementalTransform):
 
         self.seen_data = True
 
+        index_column: Optional[str] = None
         if self.start_value is not None:
             try:
                 start_value_scalar = to_arrow_scalar(self.start_value, cursor_data_type)
@@ -518,12 +615,12 @@ class ArrowIncremental(IncrementalTransform):
             tbl = tbl.filter(keep_filter)
             if self.boundary_deduplication:
                 # Deduplicate after filtering old values
-                tbl = self._add_unique_index(tbl)
+                tbl, index_column = self._add_unique_index(tbl)
                 # Remove already processed rows where the cursor is equal to the start value
                 eq_rows = tbl.filter(pa.compute.equal(tbl[cursor_path], start_value_scalar))
                 # compute index, unique hash mapping
                 unique_values_index = self.compute_unique_values_with_index(
-                    eq_rows, unique_columns, self.start_hashes_legacy
+                    eq_rows, unique_columns, index_column, self.start_hashes_legacy
                 )
                 unique_values_index = [
                     (i, uq_val)
@@ -534,7 +631,7 @@ class ArrowIncremental(IncrementalTransform):
                     # find rows with unique ids that were stored from previous run
                     remove_idx = pa.array(i for i, _ in unique_values_index)
                     tbl = tbl.filter(
-                        pa.compute.invert(pa.compute.is_in(tbl[self._dlt_index], remove_idx))
+                        pa.compute.invert(pa.compute.is_in(tbl[index_column], remove_idx))
                     )
 
         if (
@@ -545,6 +642,8 @@ class ArrowIncremental(IncrementalTransform):
         ):  # Last value has changed
             self.last_value = row_value
             if self.boundary_deduplication:
+                # rows buffered by a json transform at the previous boundary are stale now
+                self.last_rows = []
                 # Compute unique hashes for all rows equal to row value
                 self.unique_hashes = set(
                     self.compute_unique_values(
@@ -566,8 +665,8 @@ class ArrowIncremental(IncrementalTransform):
             )
 
         # drop the temp unique index before concat and returning
-        if "_dlt_index" in tbl.schema.names:
-            tbl = pyarrow.remove_columns(tbl, ["_dlt_index"])
+        if index_column is not None and index_column in tbl.schema.names:
+            tbl = pyarrow.remove_columns(tbl, [index_column])
 
         if self.on_cursor_value_missing == "include":
             if tbl.schema.field(cursor_path).nullable:

@@ -80,6 +80,7 @@ from dlt.extract.incremental.transform import (
     ArrowIncremental,
     ModelIncremental,
     IncrementalTransform,
+    IncrementalRunState,
 )
 from dlt.extract.incremental.lag import apply_lag_with_suppression
 
@@ -224,6 +225,8 @@ class Incremental(
         """Becomes true on the first item that is out of range of `start_value`. I.e. when using `max` this is a value that is lower than `start_value`"""
 
         self._transformers: Dict[Type[IncrementalTransform], IncrementalTransform] = {}
+        self._run_state: Optional[IncrementalRunState] = None
+        """Cursor progress shared by all item transforms during a run. Created on bind."""
         self._bound_pipe: SupportsPipe = None
         """Bound pipe"""
         self.range_start = range_start
@@ -734,7 +737,11 @@ class Incremental(
         # save existing last value as future start value that will be used only
         # if last value really advances
         self._cached_state_start_value = self._cached_state["last_value"]
-        # Clear transforms so we get new instances
+        # pin the run-start state and clear transforms so we get new instances. The pinned
+        # hashes must be taken before any page advances the cursor.
+        self._run_state = IncrementalRunState(
+            self._start_value, self._cached_state["unique_hashes"]
+        )
         self._transformers.clear()
         return self
 
@@ -782,6 +789,12 @@ class Incremental(
     def _make_or_get_transformer(self, cls: Type[IncrementalTransform]) -> IncrementalTransform:
         if transformer := self._transformers.get(cls):
             return transformer
+        # all transforms of this run share one cursor progress so that mixing row and batch
+        # items on consecutive pages never rewinds the cursor to the run start value
+        if self._run_state is None:
+            self._run_state = IncrementalRunState(
+                self._start_value, self._cached_state["unique_hashes"]
+            )
         transformer = self._transformers[cls] = cls(
             self.resource_name,
             self.cursor_path,
@@ -795,6 +808,7 @@ class Incremental(
             self.lag,
             self.range_start,
             self.range_end,
+            run_state=self._run_state,
         )
         # ModelIncremental needs a back-reference so it can auto-apply
         # `relation.incremental(self)` when the user yields a bare relation.

@@ -5748,3 +5748,358 @@ def test_public_lagged_datetime_range(cursor_type: type[datetime], use_lag: bool
     assert end is None
     assert type(incr._start_value) is datetime
     assert type(incr._cached_state["last_value"]) is datetime
+
+
+def _page_items(item_type: TestDataItemFormat, rows: List[Dict[str, Any]]) -> List[Any]:
+    """Data items for one page in the requested format. `object` yields one item per row."""
+    if not rows:
+        return []
+    items = data_to_item_format(item_type, rows)
+    return list(items)
+
+
+def _records(item: TDataItem) -> List[Dict[str, Any]]:
+    if item is None:
+        return []
+    if isinstance(item, list):
+        return [r for sub in item for r in _records(sub)]
+    if isinstance(item, dict):
+        return [item]
+    import pandas as pd
+
+    if isinstance(item, pd.DataFrame):
+        return item.to_dict("records")
+    return item.to_pylist()
+
+
+@pytest.mark.parametrize("item_type", ALL_TEST_DATA_ITEM_FORMATS)
+def test_batch_input_filters_like_rows_and_keeps_progress(
+    item_type: TestDataItemFormat,
+) -> None:
+    """A batch item holding the processed boundary row and a newer row must yield only the
+    newer row, exactly like yielding those two rows one by one."""
+    t0 = "2024-01-01T10:00:00+00:00"
+    t1 = "2024-01-01T11:00:00+00:00"
+    pages = [[{"order_id": 1, "ts": t0}]]
+
+    @dlt.resource(primary_key="order_id", name="orders")
+    def orders(ts=dlt.sources.incremental("ts")):
+        for page in pages:
+            yield from _page_items(item_type, page)
+
+    with Container().injectable_context(StateInjectableContext(state={})):
+        # first run loads order 1 at 10:00 and remembers it as processed
+        r = orders()
+        assert _records(list(r)) == [{"order_id": 1, "ts": t0}]
+        assert r.state["incremental"]["ts"]["last_value"] == t0
+
+        # next round re-reads 10:00 (already processed) plus the new 11:00
+        pages = [[{"order_id": 1, "ts": t0}, {"order_id": 1, "ts": t1}]]
+        r = orders()
+        assert _records(list(r)) == [{"order_id": 1, "ts": t1}]
+        s = r.state["incremental"]["ts"]
+        assert s["last_value"] == t1
+        # the processed 10:00 row is still remembered
+        assert s["unique_hashes"] == [digest_dedup_value(1)]
+
+
+@pytest.mark.parametrize("item_type", ALL_TEST_DATA_ITEM_FORMATS)
+def test_batch_page_does_not_rewind_progress_on_older_rows(
+    item_type: TestDataItemFormat,
+) -> None:
+    """Rows on a later page are filtered against the run start, never against the cursor
+    advanced by the preceding page. Old rows must not move the saved cursor back."""
+    t0 = "2024-01-01T10:00:00+00:00"
+    t15 = "2024-01-01T15:00:00+00:00"
+    t20 = "2024-01-01T20:00:00+00:00"
+    t23 = "2024-01-01T23:00:00+00:00"
+    pages: List[List[Dict[str, Any]]] = [[{"order_id": 1, "ts": t15}]]
+
+    @dlt.resource(primary_key="order_id", name="orders")
+    def orders(ts=dlt.sources.incremental("ts")):
+        for page in pages:
+            yield from _page_items(item_type, page)
+
+    with Container().injectable_context(StateInjectableContext(state={})):
+        # first round advances the saved cursor to 15:00
+        list(orders())
+
+        # a run starts at 15:00: page 1 advances to 20:00, page 2 only has a row older
+        # than the run start, which must be dropped and must not move the cursor back
+        pages = [[{"order_id": 2, "ts": t20}], [{"order_id": 3, "ts": t0}]]
+        result = list(orders())
+        assert _records(result) == [{"order_id": 2, "ts": t20}]
+        assert orders().state["incremental"]["ts"]["last_value"] == t20
+
+        # a run starts at 20:00: a page 2 boundary row is older than that start and is
+        # dropped too; the cursor stays at 20:00 instead of falling back to this run start
+        pages = [[{"order_id": 2, "ts": t20}], [{"order_id": 4, "ts": t15}]]
+        result = list(orders())
+        assert _records(result) == []
+        assert orders().state["incremental"]["ts"]["last_value"] == t20
+
+        # an empty page never overwrites the progress made by a preceding page
+        pages = [[{"order_id": 5, "ts": t23}], []]
+        result = list(orders())
+        assert _records(result) == [{"order_id": 5, "ts": t23}]
+        assert orders().state["incremental"]["ts"]["last_value"] == t23
+
+
+@pytest.mark.parametrize("item_type", ALL_TEST_DATA_ITEM_FORMATS)
+def test_batch_pages_keep_progress_across_rounds(item_type: TestDataItemFormat) -> None:
+    """Batch pages advance the saved cursor round after round without falling back to the
+    run start, including when a later page carries only already processed data."""
+    t0 = "2024-01-01T10:00:00+00:00"
+    t11 = "2024-01-01T11:00:00+00:00"
+    t15 = "2024-01-01T15:00:00+00:00"
+    t20 = "2024-01-01T20:00:00+00:00"
+    t23 = "2024-01-01T23:00:00+00:00"
+    pages: List[List[Dict[str, Any]]] = [[{"order_id": 1, "ts": t15}]]
+
+    @dlt.resource(primary_key="order_id", name="orders")
+    def orders(ts=dlt.sources.incremental("ts")):
+        for page in pages:
+            yield from _page_items(item_type, page)
+
+    with Container().injectable_context(StateInjectableContext(state={})):
+        # seed the run start at 15:00
+        list(orders())
+
+        # a row page advances the cursor, a batch page that follows holds only old rows
+        # and must not move the cursor back to the run start
+        pages = [
+            [{"order_id": 2, "ts": t20}],
+            [{"order_id": 3, "ts": t0}, {"order_id": 4, "ts": t11}],
+        ]
+        result = list(orders())
+        assert _records(result) == [{"order_id": 2, "ts": t20}]
+        s = orders().state["incremental"]["ts"]
+        assert s["last_value"] == t20
+        assert s["unique_hashes"] == [digest_dedup_value(2)]
+
+        # a batch page advances the cursor and the next row page must not rewind it
+        pages = [
+            [{"order_id": 2, "ts": t20}],
+            [{"order_id": 5, "ts": t23}],
+            [{"order_id": 6, "ts": t15}],
+        ]
+        result = list(orders())
+        assert _records(result) == [{"order_id": 5, "ts": t23}]
+        s = orders().state["incremental"]["ts"]
+        assert s["last_value"] == t23
+        assert s["unique_hashes"] == [digest_dedup_value(5)]
+
+
+@pytest.mark.parametrize("batch_format", ["arrow-table", "arrow-batch", "pandas"])
+def test_reverse_cursor_mixed_pages_match_rows(batch_format: TestDataItemFormat) -> None:
+    """Reverse/backfill extraction (`min` with descending order) must advance the cursor
+    downwards per page and match a row-only run when batches are mixed in."""
+    rounds = [
+        [[{"order_id": 1, "ts": 20}]],
+        [[{"order_id": 2, "ts": 15}], [{"order_id": 3, "ts": 25}]],
+        [[{"order_id": 2, "ts": 15}], [{"order_id": 4, "ts": 25}, {"order_id": 5, "ts": 12}]],
+    ]
+
+    def _run(second_page_format: str) -> List[Tuple[List[Dict[str, Any]], Any]]:
+        pages: List[List[Tuple[str, List[Dict[str, Any]]]]] = []
+
+        @dlt.resource(primary_key="order_id", name="orders")
+        def orders(ts=dlt.sources.incremental("ts", last_value_func=min)):
+            for page_format, page in pages[-1]:
+                yield from _page_items(page_format, page)
+
+        result: List[Tuple[List[Dict[str, Any]], Any]] = []
+        with Container().injectable_context(StateInjectableContext(state={})):
+            for round_pages in rounds:
+                formats = ["object"] * len(round_pages)
+                # every page after the first one uses the batch format when requested
+                if len(formats) > 1:
+                    formats[1] = second_page_format
+                pages.append([(fmt, page) for fmt, page in zip(formats, round_pages)])
+                r = orders()
+                records = _records(list(r))
+                s = r.state["incremental"]["ts"]
+                result.append((records, (s["last_value"], list(s["unique_hashes"]))))
+        return result
+
+    result = _run(batch_format)
+    assert result == _run("object")
+    # cursor advanced downwards: 20 -> 15 -> 12
+    assert [last for _, (last, _) in result] == [20, 15, 12]
+
+
+@pytest.mark.parametrize(
+    "first_format, second_format",
+    [
+        ("object", "arrow-table"),
+        ("arrow-table", "object"),
+        ("object", "arrow-batch"),
+        ("arrow-batch", "object"),
+        ("object", "pandas"),
+        ("pandas", "object"),
+    ],
+)
+def test_mixed_pages_accumulate_state_hashes(
+    first_format: TestDataItemFormat, second_format: TestDataItemFormat
+) -> None:
+    """When one page advances the cursor and a later page (in another format) adds rows on
+    the same boundary, all boundary hashes are remembered in the saved state."""
+    t20 = "2024-01-01T20:00:00+00:00"
+    pages: List[Tuple[str, List[Dict[str, Any]]]] = []
+
+    @dlt.resource(primary_key="order_id", name="orders")
+    def orders(ts=dlt.sources.incremental("ts")):
+        for page_format, page in pages:
+            yield from _page_items(page_format, page)
+
+    with Container().injectable_context(StateInjectableContext(state={})):
+        pages = [(first_format, [{"order_id": 2, "ts": t20}])]
+        assert _records(list(orders())) == [{"order_id": 2, "ts": t20}]
+
+        # the second page stays on the same boundary and adds a new row
+        pages = [
+            (first_format, [{"order_id": 2, "ts": t20}]),
+            (second_format, [{"order_id": 3, "ts": t20}]),
+        ]
+        assert _records(list(orders())) == [{"order_id": 3, "ts": t20}]
+        s = orders().state["incremental"]["ts"]
+        assert s["last_value"] == t20
+        # both rows on the boundary are remembered as processed
+        assert set(s["unique_hashes"]) == {digest_dedup_value(2), digest_dedup_value(3)}
+
+
+@pytest.mark.parametrize("item_type", ALL_TEST_DATA_ITEM_FORMATS)
+def test_duplicate_rows_within_round_follow_row_rules(item_type: TestDataItemFormat) -> None:
+    """Repeated rows inside one round are handled by the same existing rule for rows and
+    batches: only rows already processed in previous rounds are dropped."""
+    pages: List[List[Dict[str, Any]]] = [[{"order_id": 1, "ts": 10}]]
+
+    @dlt.resource(primary_key="order_id", name="orders")
+    def orders(ts=dlt.sources.incremental("ts")):
+        for page in pages:
+            yield from _page_items(item_type, page)
+
+    with Container().injectable_context(StateInjectableContext(state={})):
+        assert _records(list(orders())) == [{"order_id": 1, "ts": 10}]
+
+        # an already processed row repeated twice in this round is dropped
+        pages = [[{"order_id": 1, "ts": 10}, {"order_id": 1, "ts": 10}]]
+        assert _records(list(orders())) == []
+
+        # two copies of a new boundary row come through, as rows do
+        pages = [[{"order_id": 2, "ts": 10}, {"order_id": 2, "ts": 10}]]
+        assert _records(list(orders())) == [
+            {"order_id": 2, "ts": 10},
+            {"order_id": 2, "ts": 10},
+        ]
+
+
+@pytest.mark.parametrize(
+    "row_format, batch_format",
+    [
+        ("arrow-table", "object"),
+        ("arrow-batch", "object"),
+        ("pandas", "object"),
+        ("object", "arrow-table"),
+        ("object", "arrow-batch"),
+        ("object", "pandas"),
+    ],
+)
+def test_mixed_row_and_batch_pages_match_row_only_run(
+    row_format: TestDataItemFormat, batch_format: TestDataItemFormat
+) -> None:
+    """Pages that alternate between row input and batch input must produce the same records and
+    the same saved state as a run that receives all pages in one format."""
+    t0 = "2024-01-01T10:00:00+00:00"
+    t11 = "2024-01-01T11:00:00+00:00"
+    t15 = "2024-01-01T15:00:00+00:00"
+    t20 = "2024-01-01T20:00:00+00:00"
+    t23 = "2024-01-01T23:00:00+00:00"
+
+    rounds = [
+        # seed the cursor at 15:00
+        [[{"order_id": 1, "ts": t15}]],
+        # page 1 advances to 20:00, page 2 holds only old rows
+        [
+            [{"order_id": 2, "ts": t20}],
+            [{"order_id": 3, "ts": t0}, {"order_id": 4, "ts": t11}],
+        ],
+        # page 1 advances to 23:00, page 2 holds only an old row
+        [
+            [{"order_id": 2, "ts": t20}, {"order_id": 5, "ts": t23}],
+            [{"order_id": 6, "ts": t15}],
+        ],
+    ]
+
+    def _run(formats: List[List[str]]) -> List[Tuple[List[Dict[str, Any]], Any]]:
+        rounds_pages: List[List[Tuple[str, List[Dict[str, Any]]]]] = []
+
+        @dlt.resource(primary_key="order_id", name="orders")
+        def orders(ts=dlt.sources.incremental("ts")):
+            for page_format, page in rounds_pages[-1]:
+                yield from _page_items(page_format, page)
+
+        result: List[Tuple[List[Dict[str, Any]], Any]] = []
+        with Container().injectable_context(StateInjectableContext(state={})):
+            for round_index, round_pages in enumerate(rounds):
+                rounds_pages.append(list(zip(formats[round_index], round_pages)))
+                r = orders()
+                records = _records(list(r))
+                s = r.state["incremental"]["ts"]
+                result.append(
+                    (
+                        records,
+                        {
+                            "last_value": s["last_value"],
+                            "start_value": s["start_value"],
+                            "unique_hashes": list(s["unique_hashes"]),
+                        },
+                    )
+                )
+        return result
+
+    # alternate between the requested formats page by page
+    alternating = [
+        [row_format if i % 2 == 0 else batch_format for i in range(len(round_pages))]
+        for round_pages in rounds
+    ]
+    # the same data, every page in a single format
+    uniform = [[row_format] * len(round_pages) for round_pages in rounds]
+    assert _run(alternating) == _run(uniform)
+
+
+@pytest.mark.parametrize("last_value_func", [max, min], ids=["max", "min"])
+@pytest.mark.parametrize("range_start", ["closed", "open"])
+def test_batch_dedup_keeps_rows_at_new_cursor_value(
+    last_value_func: Any, range_start: TIncrementalRange
+) -> None:
+    """Deduplicating a batch must remove only rows that were already processed. A row sharing a
+    primary key with a processed row but sitting at a new cursor value must stay."""
+    import pandas as pd
+
+    sign = 1 if last_value_func is max else -1
+    boundary = sign * 10
+    newer = sign * 11
+    pages = [[{"order_id": 1, "ts": boundary}]]
+
+    @dlt.resource(primary_key="order_id", name="orders")
+    def orders(
+        ts=dlt.sources.incremental("ts", last_value_func=last_value_func, range_start=range_start),
+    ):
+        for page in pages:
+            yield pa.Table.from_pandas(pd.DataFrame(page))
+
+    with Container().injectable_context(StateInjectableContext(state={})):
+        list(orders())
+        # same order at the boundary and at the next cursor value in a single batch
+        pages = [[{"order_id": 1, "ts": boundary}, {"order_id": 1, "ts": newer}]]
+        result = list(orders())
+        assert result[0].to_pylist() == [{"order_id": 1, "ts": newer}]
+        s = orders().state["incremental"]["ts"]
+        assert s["last_value"] == newer
+        if range_start == "closed":
+            # the hash of the row processed at the new boundary is kept
+            assert s["unique_hashes"] == [digest_dedup_value(1)]
+        else:
+            # an open start disables boundary deduplication altogether
+            assert s["unique_hashes"] == []
