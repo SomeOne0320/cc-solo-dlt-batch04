@@ -40,6 +40,7 @@ from dlt.sources.helpers.rest_client.auth import (
     BearerTokenAuth,
     APIKeyAuth,
     OAuth2ClientCredentials,
+    OAuth2RefreshTokenAuth,
 )
 
 PaginatorType = Literal[
@@ -139,7 +140,13 @@ PaginatorConfig = Union[
 ]
 
 
-AuthType = Literal["bearer", "api_key", "http_basic", "oauth2_client_credentials"]
+AuthType = Literal[
+    "bearer",
+    "api_key",
+    "http_basic",
+    "oauth2_client_credentials",
+    "oauth2_refresh_token",
+]
 
 
 class AuthTypeConfig(TypedDict, total=True):
@@ -181,6 +188,21 @@ class OAuth2ClientCredentialsConfig(AuthTypeConfig, total=False):
     session: Optional[Session]
 
 
+class OAuth2RefreshTokenConfig(AuthTypeConfig, total=False):
+    """Uses OAuth 2.0 refresh token authorization"""
+
+    access_token: Optional[str]
+    refresh_token: str
+    refresh_token_url: Optional[str]
+    access_token_url: Optional[str]
+    client_id: Optional[str]
+    client_secret: Optional[str]
+    refresh_token_request_data: Optional[Dict[str, Any]]
+    access_token_request_data: Optional[Dict[str, Any]]
+    default_token_expiration: Optional[int]
+    session: Optional[Session]
+
+
 # TODO: add later
 # class OAuthJWTAuthConfig(AuthTypeConfig, total=True):
 
@@ -196,6 +218,8 @@ AuthConfig = Union[
     HttpBasicAuthConfig,
     OAuth2ClientCredentials,
     OAuth2ClientCredentialsConfig,
+    OAuth2RefreshTokenAuth,
+    OAuth2RefreshTokenConfig,
 ]
 
 

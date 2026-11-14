@@ -706,6 +706,7 @@ The available authentication methods are defined in the `dlt.sources.helpers.res
 - [APIKeyAuth](#api-key-authentication)
 - [HttpBasicAuth](#http-basic-authentication)
 - [OAuth2ClientCredentials](#oauth-20-authorization)
+- [OAuth2RefreshTokenAuth](#oauth-20-refresh-token-authorization)
 
 For specific use cases, you can [implement custom authentication](#implementing-custom-authentication) by subclassing the `AuthConfigBase` class from the `dlt.sources.helpers.rest_client.auth` module.
 For specific flavors of OAuth 2.0, you can [implement custom OAuth 2.0](#oauth-20-authorization) by subclassing `OAuth2ClientCredentials`.
@@ -829,6 +830,59 @@ oauth = OAuth2ClientCredentialsHTTPBasic(
 client = RESTClient(base_url="https://api.zoom.us/v2", auth=oauth)
 
 response = client.get("/users")
+```
+
+### OAuth 2.0 refresh token authorization
+
+OAuth 2.0 refresh token flow is used when a long-lived `refresh_token` is available (for example issued once through an interactive login). The client exchanges it for a short-lived access token.
+
+`OAuth2RefreshTokenAuth` obtains an access token on the first request and renews it automatically when it expires, so long-running extractions keep working. While the access token is valid it is reused for every request.
+
+- If the authorization server returns `expires_in`, it defines the token lifetime. Otherwise `default_token_expiration` (in seconds) is used.
+- If the response contains a new `refresh_token`, it replaces the old one for the next refresh. If it does not, the existing refresh token is reused.
+- When several resources share one authenticator and refresh concurrently, the token is refreshed only once.
+- If the refresh fails or the response has no `access_token`, `OAuth2TokenRefreshError` is raised and the previous authentication state is kept, so the next request may retry.
+
+**Parameters:**
+
+- `refresh_token`: The long-lived refresh token.
+- `refresh_token_url`: The URL of the authorization server endpoint that exchanges the refresh token for an access token.
+- `access_token`: The temporary token. Usually not provided because it is obtained automatically.
+- `client_id` / `client_secret`: Optional client credentials sent with the refresh request.
+- `refresh_token_request_data`: Additional data sent as JSON with the refresh request. Defaults to `None`.
+- `default_token_expiration`: Token lifetime in seconds when the server does not return `expires_in`. Defaults to 3600.
+- `session`: Custom `requests` session where you can configure default timeouts and retry strategies.
+
+**Example:**
+
+```py
+from dlt.sources.helpers.rest_client import RESTClient
+from dlt.sources.helpers.rest_client.auth import OAuth2RefreshTokenAuth
+
+auth = OAuth2RefreshTokenAuth(
+    refresh_token_url="https://api.example.com/oauth/token",
+    refresh_token=dlt.secrets["sources.example.refresh_token"],
+)
+client = RESTClient(base_url="https://api.example.com", auth=auth)
+
+response = client.get("/users")
+```
+
+The same authenticator can be used in the declarative REST API source configuration:
+
+```py
+{
+    "client": {
+        "base_url": "https://api.example.com",
+        "auth": {
+            "type": "oauth2_refresh_token",
+            "refresh_token_url": "https://api.example.com/oauth/token",
+            "refresh_token": dlt.secrets["sources.example.refresh_token"],
+            "default_token_expiration": 3600,
+        },
+    },
+    "resources": ["users"],
+}
 ```
 
 ### Implementing custom authentication

@@ -23,6 +23,7 @@ from dlt.sources.helpers.rest_client.auth import (
     APIKeyAuth,
     AuthConfigBase,
     OAuth2ClientCredentials,
+    OAuth2RefreshTokenAuth,
 )
 from dlt.sources.helpers.rest_client.typing import HTTPMethodBasic
 from dlt.sources.helpers.rest_client.redaction import SENSITIVE_PARAMS
@@ -57,7 +58,7 @@ from .utils import check_connection  # noqa: F401
 
 PARAM_TYPES: List[ParamBindType] = ["incremental", "resolve"]
 MIN_SECRET_MASKING_LENGTH = 3
-SENSITIVE_KEYS: List[str] = list(SENSITIVE_PARAMS) + ["username", "client_id"]
+SENSITIVE_KEYS: List[str] = list(SENSITIVE_PARAMS) + ["username", "client_id", "refresh_token"]
 
 
 @decorators.source
@@ -382,7 +383,13 @@ def _mask_secrets(auth_config: AuthConfig) -> AuthConfig:
     if (
         isinstance(
             auth_config,
-            (APIKeyAuth, BearerTokenAuth, HttpBasicAuth, OAuth2ClientCredentials),
+            (
+                APIKeyAuth,
+                BearerTokenAuth,
+                HttpBasicAuth,
+                OAuth2ClientCredentials,
+                OAuth2RefreshTokenAuth,
+            ),
         )
         or has_sensitive_key
     ):

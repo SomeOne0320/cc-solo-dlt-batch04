@@ -50,6 +50,7 @@ from dlt.sources.helpers.rest_client.auth import (
     BearerTokenAuth,
     APIKeyAuth,
     OAuth2ClientCredentials,
+    OAuth2RefreshTokenAuth,
 )
 from dlt.sources.helpers.rest_client.client import RESTClient, raise_for_status
 from dlt.sources.helpers.rest_client.redaction import sanitize_url
@@ -91,6 +92,7 @@ AUTH_MAP: Dict[str, Type[AuthConfigBase]] = {
     "api_key": APIKeyAuth,
     "http_basic": HttpBasicAuth,
     "oauth2_client_credentials": OAuth2ClientCredentials,
+    "oauth2_refresh_token": OAuth2RefreshTokenAuth,
 }
 
 

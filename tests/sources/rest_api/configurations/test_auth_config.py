@@ -33,6 +33,7 @@ from dlt.sources.helpers.rest_client.auth import (
     BearerTokenAuth,
     HttpBasicAuth,
     OAuth2ClientCredentials,
+    OAuth2RefreshTokenAuth,
 )
 
 from .source_configs import (
@@ -55,6 +56,8 @@ def test_auth_shorthands(auth_type: AuthType, section: str) -> None:
             f"{section}__ACCESS_TOKEN_URL": "https://example.com/oauth/token",
             f"{section}__CLIENT_ID": "a_client_id",
             f"{section}__CLIENT_SECRET": "a_client_secret",
+            f"{section}__REFRESH_TOKEN_URL": "https://example.com/oauth/refresh",
+            f"{section}__REFRESH_TOKEN": "a_refresh_token",
         }
     ):
         # shorthands need to instantiate from config
@@ -80,6 +83,10 @@ def test_auth_shorthands(auth_type: AuthType, section: str) -> None:
                 assert auth.client_id == "a_client_id"
                 assert auth.client_secret == "a_client_secret"
                 assert auth.default_token_expiration == 3600
+            if isinstance(auth, OAuth2RefreshTokenAuth):
+                assert auth.refresh_token_url == "https://example.com/oauth/refresh"
+                assert auth.refresh_token == "a_refresh_token"
+                assert auth.default_token_expiration == 3600
 
 
 @pytest.mark.parametrize("auth_type_config", AUTH_TYPE_CONFIGS)
@@ -95,6 +102,7 @@ def test_auth_type_configs(auth_type_config: AuthTypeConfig, section: str) -> No
             f"{section}__PASSWORD": "password",
             f"{section}__CLIENT_SECRET": "a_client_secret",
             f"{section}__CLIENT_ID": "a_client_id",
+            f"{section}__REFRESH_TOKEN": "a_refresh_token",
         }
     ):
         # shorthands need to instantiate from config
@@ -122,6 +130,12 @@ def test_auth_type_configs(auth_type_config: AuthTypeConfig, section: str) -> No
                 # injected
                 assert auth.client_id == "a_client_id"
                 assert auth.client_secret == "a_client_secret"
+            if isinstance(auth, OAuth2RefreshTokenAuth):
+                assert auth.refresh_token_url == "https://example.com/oauth/refresh"
+                assert auth.default_token_expiration == 60
+                assert auth.refresh_token_request_data == {"foo": "bar"}
+                # injected
+                assert auth.refresh_token == "a_refresh_token"
 
 
 @pytest.mark.parametrize(
@@ -156,13 +170,59 @@ def test_bearer_token_fallback() -> None:
     assert auth.token == "secret"
 
 
+def test_refresh_token_auth_from_dict_config() -> None:
+    auth = create_auth(
+        {
+            "type": "oauth2_refresh_token",
+            "refresh_token": "a_refresh_token",
+            "refresh_token_url": "https://example.com/oauth/refresh",
+            "default_token_expiration": 120,
+        }
+    )
+    assert isinstance(auth, OAuth2RefreshTokenAuth)
+    assert auth.refresh_token == "a_refresh_token"
+    assert auth.refresh_token_url == "https://example.com/oauth/refresh"
+    assert auth.default_token_expiration == 120
+    # an access token is obtained on the first request
+    assert auth.is_token_expired()
+
+
+def test_refresh_token_auth_from_instance_config() -> None:
+    auth = OAuth2RefreshTokenAuth(
+        refresh_token="a_refresh_token",
+        refresh_token_url="https://example.com/oauth/refresh",
+    )
+    resolved_auth = create_auth(auth)
+    assert resolved_auth is auth
+    assert auth.refresh_token == "a_refresh_token"
+
+
+def test_refresh_token_auth_instance_is_reusable_and_copyable() -> None:
+    auth = OAuth2RefreshTokenAuth(
+        refresh_token="a_refresh_token",
+        refresh_token_url="https://example.com/oauth/refresh",
+    )
+    # an auth instance may be shared by several resources
+    first = create_auth(auth)
+    second = create_auth(auth)
+    assert first is auth
+    assert second is auth
+
+    # copies keep the configuration and may obtain their own tokens
+    copied = auth.copy()
+    assert isinstance(copied, OAuth2RefreshTokenAuth)
+    assert copied.refresh_token == auth.refresh_token
+    assert copied.refresh_token_url == auth.refresh_token_url
+    assert copied.session is not None
+
+
 def test_error_message_invalid_auth_type() -> None:
     with pytest.raises(ValueError) as e:
         create_auth("non_existing_method")  # type: ignore
     assert (
-        str(e.value)
-        == "Received invalid value `auth_type=non_existing_method`. "
-        "Valid values are: ['bearer', 'api_key', 'http_basic', 'oauth2_client_credentials']"
+        str(e.value) == "Received invalid value `auth_type=non_existing_method`. "
+        "Valid values are: ['bearer', 'api_key', 'http_basic', 'oauth2_client_credentials',"
+        " 'oauth2_refresh_token']"
     )
 
 
@@ -193,7 +253,14 @@ def test_error_message_incorrect_auth_object() -> None:
 class AuthConfigTest(NamedTuple):
     secret_keys: List[
         Literal[
-            "token", "api_key", "password", "username", "client_id", "client_secret", "access_token"
+            "token",
+            "api_key",
+            "password",
+            "username",
+            "client_id",
+            "client_secret",
+            "access_token",
+            "refresh_token",
         ]
     ]
     config: Union[Dict[str, Any], AuthConfigBase]
@@ -275,6 +342,25 @@ AUTH_CONFIGS = [
             client_secret=SENSITIVE_SECRET,
         ),
         masked_secrets=["s*****t", "s*****t", "s*****t"],
+    ),
+    AuthConfigTest(
+        secret_keys=["refresh_token", "access_token"],
+        config={
+            "type": "oauth2_refresh_token",
+            "refresh_token": "sensitive-secret",
+            "refresh_token_url": "https://example.com/oauth/token",
+            "access_token": "sensitive-secret",
+        },
+        masked_secrets=["s*****t", "s*****t"],
+    ),
+    AuthConfigTest(
+        secret_keys=["refresh_token", "access_token"],
+        config=OAuth2RefreshTokenAuth(
+            refresh_token=SENSITIVE_SECRET,
+            refresh_token_url="https://example.com/oauth/token",
+            access_token=SENSITIVE_SECRET,
+        ),
+        masked_secrets=["s*****t", "s*****t"],
     ),
 ]
 

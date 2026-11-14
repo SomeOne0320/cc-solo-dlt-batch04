@@ -1,5 +1,7 @@
 import os
+import threading
 from base64 import b64encode
+from copy import copy, deepcopy
 from typing import Any, Dict, cast, List, Optional
 from unittest.mock import patch, ANY
 
@@ -19,10 +21,14 @@ from dlt.sources.helpers.rest_client.auth import (
     BearerTokenAuth,
     HttpBasicAuth,
     OAuth2ClientCredentials,
+    OAuth2RefreshTokenAuth,
     OAuthJWTAuth,
 )
 from dlt.sources.helpers.rest_client.client import Hooks
-from dlt.sources.helpers.rest_client.exceptions import IgnoreResponseException
+from dlt.sources.helpers.rest_client.exceptions import (
+    IgnoreResponseException,
+    OAuth2TokenRefreshError,
+)
 from dlt.sources.helpers.rest_client.paginators import (
     JSONLinkPaginator,
     BaseReferencePaginator,
@@ -276,6 +282,175 @@ class TestRESTClient:
             expiry_2 = auth.token_expiry
             assert expiry_2 > expiry_1
             assert response.json()["data"][0] == {"id": 0, "title": "Post 0"}
+
+    def test_oauth2_refresh_token_flow_auth_success(self, rest_client: RESTClient):
+        auth = OAuth2RefreshTokenAuth(
+            refresh_token_url="https://api.example.com/auth/refresh",
+            refresh_token="valid-refresh-token",
+            session=Client().session,
+        )
+        response = rest_client.get("/protected/posts/refresh-token", auth=auth)
+
+        assert response.status_code == 200
+        assert response.request.headers["Authorization"] == "Bearer new-valid-token"
+
+        # the valid token is reused for subsequent requests
+        with patch.object(auth, "obtain_token", wraps=auth.obtain_token) as mock_obtain_token:
+            rest_client.get("/protected/posts/refresh-token", auth=auth)
+            mock_obtain_token.assert_not_called()
+
+    def test_oauth2_refresh_token_renews_expired_token(self, rest_client: RESTClient):
+        auth = OAuth2RefreshTokenAuth(
+            refresh_token_url="https://api.example.com/auth/refresh",
+            refresh_token="valid-refresh-token",
+            default_token_expiration=60,
+            session=Client().session,
+        )
+        rest_client.get("/protected/posts/refresh-token", auth=auth)
+        assert auth.token_expiry is not None
+
+        # force expiry (the configured default is 60s) and renew on the next request
+        auth.token_expiry = auth.token_expiry.subtract(seconds=61)
+        assert auth.is_token_expired()
+        with patch.object(auth, "obtain_token", wraps=auth.obtain_token) as mock_obtain_token:
+            response = rest_client.get("/protected/posts/refresh-token", auth=auth)
+            mock_obtain_token.assert_called_once()
+        assert response.status_code == 200
+
+    def test_oauth2_refresh_token_default_expiration(self):
+        auth = OAuth2RefreshTokenAuth(
+            refresh_token_url="https://api.example.com/auth/refresh",
+            refresh_token="valid-refresh-token",
+            default_token_expiration=1234,
+            session=Client().session,
+        )
+        auth.obtain_token()
+        # the mock does not return `expires_in`, so the configured default applies
+        assert auth.token_expiry is not None
+        expires_in = auth.token_expiry.diff().in_seconds()
+        assert 1150 < expires_in <= 1234
+
+    def test_oauth2_refresh_token_rotation(self):
+        auth = OAuth2RefreshTokenAuth(
+            refresh_token_url="https://api.example.com/auth/refresh-with-expiry",
+            refresh_token="rotating-refresh-token",
+            session=Client().session,
+        )
+        auth.obtain_token()
+        assert auth.access_token == "expiring-access-token"
+        # a new refresh token is used from the response
+        assert auth.refresh_token == "rotated-refresh-token"
+
+    def test_oauth2_refresh_token_keeps_old_refresh_token(self):
+        auth = OAuth2RefreshTokenAuth(
+            refresh_token_url="https://api.example.com/auth/refresh",
+            refresh_token="valid-refresh-token",
+            session=Client().session,
+        )
+        auth.obtain_token()
+        # the mock does not return a new refresh token, so the old one is kept
+        assert auth.refresh_token == "valid-refresh-token"
+
+    @pytest.mark.parametrize(
+        "response",
+        [
+            pytest.param({"error": "Invalid refresh token"}, id="missing_access_token"),
+            pytest.param({}, id="empty_response"),
+        ],
+    )
+    def test_oauth2_refresh_token_failure_keeps_state(
+        self, response: Dict[str, Any], mocker
+    ) -> None:
+        auth = OAuth2RefreshTokenAuth(
+            refresh_token_url="https://api.example.com/auth/refresh",
+            refresh_token="valid-refresh-token",
+            session=Client().session,
+        )
+        auth.access_token = "previous-token"
+        auth.token_expiry = None
+        previous_refresh_token = auth.refresh_token
+
+        with requests_mock.Mocker() as m:
+            m.post("https://api.example.com/auth/refresh", json=response)
+            with pytest.raises(OAuth2TokenRefreshError):
+                auth.obtain_token()
+
+        # the previous auth state is preserved so the refresh may be retried
+        assert auth.access_token == "previous-token"
+        assert auth.refresh_token == previous_refresh_token
+
+    def test_oauth2_refresh_token_http_error_keeps_state(self) -> None:
+        auth = OAuth2RefreshTokenAuth(
+            refresh_token_url="https://api.example.com/auth/refresh",
+            refresh_token="invalid-refresh-token",
+            session=Client().session,
+        )
+        auth.access_token = "previous-token"
+
+        with requests_mock.Mocker() as m:
+            m.post(
+                "https://api.example.com/auth/refresh",
+                status_code=401,
+                json={"error": "Invalid refresh token"},
+            )
+            with pytest.raises(OAuth2TokenRefreshError) as exc_info:
+                auth.obtain_token()
+
+        assert exc_info.value.response is not None
+        assert exc_info.value.response.status_code == 401
+        assert auth.access_token == "previous-token"
+        assert auth.refresh_token == "invalid-refresh-token"
+
+    def test_oauth2_refresh_token_missing_config_raises(self) -> None:
+        auth = OAuth2RefreshTokenAuth(refresh_token_url=None, session=Client().session)
+        with pytest.raises(OAuth2TokenRefreshError, match="refresh_token"):
+            auth.obtain_token()
+
+        auth = OAuth2RefreshTokenAuth(refresh_token="valid-refresh-token", session=Client().session)
+        with pytest.raises(OAuth2TokenRefreshError, match="refresh_token_url"):
+            auth.obtain_token()
+
+    def test_oauth2_refresh_token_concurrent_requests_refresh_once(self) -> None:
+        auth = OAuth2RefreshTokenAuth(
+            refresh_token_url="https://api.example.com/auth/refresh",
+            refresh_token="valid-refresh-token",
+            session=Client().session,
+        )
+        barrier = threading.Barrier(8)
+        errors: List[BaseException] = []
+
+        def request() -> None:
+            try:
+                barrier.wait()
+                auth.ensure_valid_access_token()
+            except BaseException as ex:  # noqa: BLE001
+                errors.append(ex)
+
+        with patch.object(auth, "obtain_token", wraps=auth.obtain_token) as mock_obtain_token:
+            threads = [threading.Thread(target=request) for _ in range(8)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+        assert not errors
+        assert mock_obtain_token.call_count == 1
+
+    def test_oauth2_refresh_token_is_copyable(self) -> None:
+        auth = OAuth2RefreshTokenAuth(
+            refresh_token_url="https://api.example.com/auth/refresh",
+            refresh_token="valid-refresh-token",
+            session=Client().session,
+        )
+        auth.obtain_token()
+        auth._get_refresh_lock()
+
+        for copied in (copy(auth), deepcopy(auth), auth.copy()):
+            assert copied.access_token == auth.access_token
+            assert copied.refresh_token == auth.refresh_token
+            assert copied.is_token_expired() is False
+            # copies get their own lock and can refresh independently
+            assert copied._get_refresh_lock() is not auth._get_refresh_lock()
 
     def test_oauth_customized_token_request(self, rest_client: RESTClient):
         class OAuth2ClientCredentialsHTTPBasic(OAuth2ClientCredentials):

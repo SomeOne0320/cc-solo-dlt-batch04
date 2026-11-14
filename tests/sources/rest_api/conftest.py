@@ -316,6 +316,14 @@ def mock_api_server():
             context.status_code = 401
             return {"error": "Unauthorized"}
 
+        @router.get("/protected/posts/refresh-token")
+        def protected_refresh_token(request, context):
+            auth = request.headers.get("Authorization")
+            if auth in ("Bearer new-valid-token", "Bearer expiring-access-token"):
+                return paginate_by_page_number(request, generate_posts())
+            context.status_code = 401
+            return {"error": "Unauthorized"}
+
         @router.get("/protected/posts/bearer-token-plain-text-error")
         def protected_bearer_token_plain_text_erorr(request, context):
             auth = request.headers.get("Authorization")
@@ -351,6 +359,18 @@ def mock_api_server():
             body = request.json()
             if body.get("refresh_token") == "valid-refresh-token":
                 return {"access_token": "new-valid-token"}
+            context.status_code = 401
+            return {"error": "Invalid refresh token"}
+
+        @router.post("/auth/refresh-with-expiry")
+        def refresh_token_with_expiry(request, context):
+            body = request.json()
+            if body.get("refresh_token") == "rotating-refresh-token":
+                return {
+                    "access_token": "expiring-access-token",
+                    "refresh_token": "rotated-refresh-token",
+                    "expires_in": 1,
+                }
             context.status_code = 401
             return {"error": "Invalid refresh token"}
 

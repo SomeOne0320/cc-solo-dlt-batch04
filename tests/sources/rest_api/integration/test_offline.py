@@ -2118,3 +2118,45 @@ def test_rest_api_endpoint_location_is_sanitized() -> None:
     location = cast(TRestApiDataLocation, resource.inputs[0])
     assert "top_secret" not in str(location)
     assert location["location"] == "https://api.example.com?api_key=***"
+
+
+def test_rest_api_source_with_refresh_token_auth(mock_api_server) -> None:
+    pipeline = dlt.pipeline(
+        pipeline_name="rest_api_refresh_token",
+        destination="duckdb",
+        dataset_name="rest_api_refresh_token",
+        dev_mode=True,
+    )
+    mock_source = rest_api_source(
+        {
+            "client": {
+                "base_url": "https://api.example.com",
+                "auth": {
+                    "type": "oauth2_refresh_token",
+                    "refresh_token": "valid-refresh-token",
+                    "refresh_token_url": "https://api.example.com/auth/refresh",
+                },
+            },
+            "resources": [
+                {
+                    "name": "posts",
+                    "endpoint": {
+                        "path": "/protected/posts/refresh-token",
+                        "data_selector": "data",
+                    },
+                }
+            ],
+        }
+    )
+
+    load_info = pipeline.run(mock_source)
+    assert_load_info(load_info)
+    assert load_table_counts(pipeline)["posts"] == DEFAULT_PAGE_SIZE * DEFAULT_TOTAL_PAGES
+
+    # all requests share a single authenticator that fetched the token once
+    refresh_requests = _filter_by_path_pattern(mock_api_server.request_history, "/auth/refresh")
+    assert len(refresh_requests) == 1
+    for request in _filter_by_path_pattern(
+        mock_api_server.request_history, "/protected/posts/refresh-token"
+    ):
+        assert request.headers["Authorization"] == "Bearer new-valid-token"

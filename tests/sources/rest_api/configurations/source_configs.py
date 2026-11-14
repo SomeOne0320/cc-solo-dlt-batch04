@@ -448,4 +448,10 @@ AUTH_TYPE_CONFIGS = [
         "access_token_request_data": {"foo": "bar"},
         "default_token_expiration": 60,
     },
+    {
+        "type": "oauth2_refresh_token",
+        "refresh_token_url": "https://example.com/oauth/refresh",
+        "refresh_token_request_data": {"foo": "bar"},
+        "default_token_expiration": 60,
+    },
 ]
