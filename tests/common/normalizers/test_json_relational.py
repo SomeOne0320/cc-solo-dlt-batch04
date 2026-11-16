@@ -1379,3 +1379,237 @@ def test_coerce_type(norm: RelationalNormalizer) -> None:
     # failure raises ValueError
     with pytest.raises(ValueError):
         norm.coerce_type("bigint", "text", "not_a_number")
+
+
+def _nested_arrays(depth: int) -> StrAny:
+    """Build `{"l": [{"l": [ ... {"leaf": "v"} ... ]}]}` with `depth` nested arrays."""
+    node: Any = {"leaf": "v"}
+    for _ in range(depth):
+        node = {"l": [node]}
+    return node
+
+
+@pytest.mark.parametrize("depth", [1, 10, 599, 600, 1000])
+def test_deep_nested_arrays_expand_without_recursion(
+    norm: RelationalNormalizer, depth: int
+) -> None:
+    # the traversal is iterative: arrays far deeper than the default python
+    # recursion limit (~1000 frames) must normalize without raising RecursionError
+    row = _nested_arrays(depth)
+    rows = list(norm.normalize_data_item(row, "load_id", "deep"))
+
+    # root row plus one row per nested array level
+    assert len(rows) == depth + 1
+
+    # parent-before-child ordering with one table per nesting level
+    expected_tables = ["deep"] + ["deep" + "__l" * i for i in range(1, depth + 1)]
+    assert [r[0][0] for r in rows] == expected_tables
+
+    # every child links to its parent and keeps its position in the list
+    row_id_by_table = {r[0][0]: r[1]["_dlt_id"] for r in rows}
+    for level, (info, r) in enumerate(rows[1:], start=1):
+        assert r["_dlt_parent_id"] == row_id_by_table[expected_tables[level - 1]]
+        assert r["_dlt_list_idx"] == 0
+
+    # the innermost leaf survives in the deepest row
+    assert rows[-1][1]["leaf"] == "v"
+
+
+def test_deep_nested_arrays_beyond_default_recursion_limit(
+    norm: RelationalNormalizer,
+) -> None:
+    # 1200 nested arrays cannot be walked with mutual generator recursion under
+    # the default recursion limit; the iterative implementation handles them
+    depth = 1200
+    rows = list(norm.normalize_data_item(_nested_arrays(depth), "load_id", "deep"))
+    # default max_nesting is 1000: root + 1000 expanded levels
+    assert len(rows) == 1001
+    assert rows[0][0][0] == "deep"
+    assert rows[-1][0][0] == "deep" + "__l" * 1000
+    # parent ids form an unbroken chain all the way down
+    for (info, child), (_, parent) in zip(rows[1:], rows):
+        assert child["_dlt_parent_id"] == parent["_dlt_id"]
+        assert child["_dlt_list_idx"] == 0
+
+
+def test_normalize_list_wrapper_still_iterative(norm: RelationalNormalizer) -> None:
+    # the public-ish _normalize_list entry point must keep working on top of the
+    # explicit stack, including mixed element types and a fixed parent id
+    rows = list(
+        norm._normalize_list(
+            [{"a": 1}, {"a": 2}, "x"],
+            {},
+            ("items",),
+            ("root",),
+            "parent-id",
+            5,
+        )
+    )
+    assert [r[0][0] for r in rows] == ["root__items"] * 3
+    assert [r[1]["_dlt_list_idx"] for r in rows] == [0, 1, 2]
+    assert all(r[1]["_dlt_parent_id"] == "parent-id" for r in rows)
+    # scalars are wrapped into a value column
+    assert rows[2][1]["value"] == "x"
+
+
+def test_deep_nested_arrays_respect_max_nesting_boundary(
+    norm: RelationalNormalizer,
+) -> None:
+    set_max_nesting(norm, 10)
+    try:
+        depth = 50
+        rows = list(norm.normalize_data_item(_nested_arrays(depth), "load_id", "deep"))
+        # one row per allowed level and nothing beyond it
+        assert len(rows) == 11
+        assert rows[-1][0][0] == "deep" + "__l" * 10
+        # the remaining content is kept as json, not expanded one level further
+        remainder = rows[-1][1]["l"]
+        assert type(remainder) is list
+    finally:
+        # restore the default nesting so other tests are not affected
+        set_max_nesting(norm, 1000)
+
+
+def test_deep_list_of_lists(norm: RelationalNormalizer) -> None:
+    # arrays nested directly inside arrays create intermediary "list" tables
+    node: Any = {"leaf": "v"}
+    depth = 1100
+    for _ in range(depth):
+        node = [node]
+    rows = list(norm.normalize_data_item({"node": node}, "load_id", "deep"))
+    # each array level needs an intermediary row and consumes two nesting levels,
+    # so the default max_nesting of 1000 yields root + 500 expanded rows
+    assert len(rows) == 501
+    tables = [r[0][0] for r in rows]
+    assert tables[0] == "deep"
+    assert tables[1] == "deep__node"
+    # every level below the root goes through an intermediary list table
+    assert all("__list" in t or t in ("deep", "deep__node") for t in tables)
+    for (info, child), (_, parent) in zip(rows[1:], rows):
+        assert child["_dlt_parent_id"] == parent["_dlt_id"]
+
+
+def _order_row() -> StrAny:
+    # an order with two products, each with its own details list, plus a sibling list
+    return {
+        "order_id": "o1",
+        "products": [
+            {"sku": "a", "details": [{"d": 1}, {"d": 2}]},
+            {"sku": "b", "details": [{"d": 3}]},
+        ],
+        "tags": ["x", "y"],
+    }
+
+
+def test_skip_descendants_continues_with_sibling_lists(
+    norm: RelationalNormalizer,
+) -> None:
+    rows_gen = norm.normalize_data_item(_order_row(), "load_id", "orders")
+
+    # root row: descend; the value sent here is consumed at the root yield and
+    # the next send resumes traversal
+    (table, _, _), _ = rows_gen.send(None)
+    assert table == "orders"
+
+    # first product: descend into its details
+    (table, _, _), product = rows_gen.send(True)
+    assert table == "orders__products"
+    assert product["sku"] == "a"
+
+    # both detail rows of the first product
+    (table, _, _), detail = rows_gen.send(True)
+    assert table == "orders__products__details"
+    assert detail["d"] == 1
+    # detail rows have no descendants; sending False must not lose the next row
+    (table, _, _), detail = rows_gen.send(False)
+    assert table == "orders__products__details"
+    assert detail["d"] == 2
+
+    # the second product is reached even though the last detail was "skipped"
+    (table, _, _), product = rows_gen.send(None)
+    assert table == "orders__products"
+    assert product["sku"] == "b"
+    # skip its details subtree; the yielded row is the first tag row because tags
+    # is the next sibling list of `products` on the root row
+    (table, _, _), tag = rows_gen.send(False)
+    assert table == "orders__tags"
+    assert tag["value"] == "x"
+    assert tag["_dlt_list_idx"] == 0
+    # the second tag must not be lost
+    (table, _, _), tag = next(rows_gen)
+    assert table == "orders__tags"
+    assert tag["value"] == "y"
+    assert tag["_dlt_list_idx"] == 1
+    with pytest.raises(StopIteration):
+        next(rows_gen)
+
+
+def test_skip_root_row_skips_whole_record(norm: RelationalNormalizer) -> None:
+    rows_gen = norm.normalize_data_item(_order_row(), "load_id", "orders")
+    rows_gen.send(None)
+    # refusing to descend into the root skips every descendant of the record
+    with pytest.raises(StopIteration):
+        rows_gen.send(False)
+
+
+def test_skip_leaf_row_does_not_lose_next_row(norm: RelationalNormalizer) -> None:
+    rows_gen = norm.normalize_data_item(_order_row(), "load_id", "orders")
+    rows_gen.send(None)  # root row
+    rows_gen.send(True)  # first product row
+    # first detail row has no descendants: sending False must still resume
+    (table, _, _), detail = rows_gen.send(True)
+    assert table == "orders__products__details"
+    assert detail["d"] == 1
+    (table, _, _), detail = rows_gen.send(False)
+    assert table == "orders__products__details"
+    assert detail["d"] == 2
+    # and traversal continues with the next product
+    (table, _, _), product = rows_gen.send(None)
+    assert table == "orders__products"
+    assert product["sku"] == "b"
+    rows_gen.close()
+
+
+def test_generator_close_keeps_next_record_clean(norm: RelationalNormalizer) -> None:
+    # close the first generator after the root row only
+    first_gen = norm.normalize_data_item(_order_row(), "load_id", "orders")
+    (table, _, _), first_root = first_gen.send(None)
+    assert table == "orders"
+    first_gen.send(True)
+    next(first_gen)  # first product row
+    first_gen.close()
+
+    # a brand new record must not carry any state from the closed traversal
+    second_row: StrAny = {"order_id": "o2", "tags": ["z"]}
+    rows = list(norm.normalize_data_item(second_row, "load_id", "orders"))
+    assert len(rows) == 2
+    root, tag = rows
+    assert root[0][0] == "orders"
+    assert root[1]["order_id"] == "o2"
+    # no propagated fields or ids from the previous record leak in
+    assert set(root[1]) == {
+        "order_id",
+        norm.c_dlt_load_id,
+        norm.c_dlt_id,
+    }
+    assert tag[0][0] == "orders__tags"
+    assert tag[1]["value"] == "z"
+    assert tag[1]["_dlt_parent_id"] == root[1]["_dlt_id"]
+
+
+def test_send_protocol_on_deep_nested_arrays(norm: RelationalNormalizer) -> None:
+    depth = 1100
+    rows_gen = norm.normalize_data_item(_nested_arrays(depth), "load_id", "deep")
+
+    # walk a handful of rows manually through send, skipping one row's descendants
+    (table, _, _), _ = rows_gen.send(None)
+    assert table == "deep"
+    (table, _, _), _ = rows_gen.send(True)
+    assert table == "deep__l"
+    # skip descendants of the level-1 row: traversal ends but never raises
+    with pytest.raises(StopIteration):
+        rows_gen.send(False)
+
+    # a fresh generator over the same data can still be consumed fully
+    rows = list(norm.normalize_data_item(_nested_arrays(depth), "load_id", "deep"))
+    assert len(rows) == 1001

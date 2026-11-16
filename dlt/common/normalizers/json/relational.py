@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from functools import lru_cache, partial
 from importlib import import_module
 from typing import (
@@ -54,6 +55,38 @@ from dlt.common.normalizers.json.helpers import (
     requires_root_key,
 )
 from dlt.common.validation import validate_dict
+
+
+@dataclass(slots=True)
+class _TraversalFrame:
+    """Base class for the explicit work stack frames of the iterative row traversal."""
+
+
+@dataclass(slots=True)
+class _RowFrame(_TraversalFrame):
+    """A dictionary row that still needs to be flattened and yielded."""
+
+    dict_row: DictStrAny
+    extend: DictStrAny
+    ident_path: Tuple[str, ...]
+    parent_path: Tuple[str, ...]
+    parent_row_id: Optional[str]
+    pos: Optional[int]
+    r_lvl: int
+    is_root: bool
+
+
+@dataclass(slots=True)
+class _ListFrame(_TraversalFrame):
+    """A sequence whose remaining elements (from `next_idx`) still need traversal."""
+
+    seq: Sequence[Any]
+    extend: DictStrAny
+    ident_path: Tuple[str, ...]
+    parent_path: Tuple[str, ...]
+    parent_row_id: Optional[str]
+    r_lvl: int
+    next_idx: int = 0
 
 
 class DataItemNormalizer(DataItemNormalizerBase[RelationalNormalizerConfig]):
@@ -240,38 +273,12 @@ class DataItemNormalizer(DataItemNormalizerBase[RelationalNormalizerConfig]):
         parent_row_id: Optional[str] = None,
         _r_lvl: int = 0,
     ) -> TNormalizedRowIterator:
-        # cache method lookups
-        shorten_fragments = self._shorten_fragments
-        should_be_nested = self._should_be_nested
-        c_value = self.c_value
-
-        table = shorten_fragments(*parent_path, *ident_path)
-        is_root = not should_be_nested(table)
-        for idx, v in enumerate(seq):
-            # use type() for exact match - faster than isinstance()
-            v_type = type(v)
-            if v_type is dict:
-                yield from self._normalize_row(
-                    v, extend, ident_path, parent_path, parent_row_id, idx, _r_lvl
-                )
-            elif v_type is list:
-                # to normalize lists of lists, we must create a tracking intermediary table
-                yield from self._normalize_row(
-                    {"list": v},
-                    extend,
-                    ident_path,
-                    parent_path,
-                    parent_row_id,
-                    idx,
-                    _r_lvl - 1,
-                )
-            else:
-                # found non-dict in seq, so wrap it
-                wrap_v: DictStrAny = {c_value: v}
-                if extend:
-                    wrap_v.update(extend)
-                self._add_row_id(table, wrap_v, wrap_v, parent_row_id, idx, is_root)
-                yield (table, parent_path, ident_path), wrap_v
+        # iterative traversal kept for backwards compatibility with direct callers;
+        # the list itself is the first frame on the work stack
+        stack: List["_TraversalFrame"] = [
+            _ListFrame(seq, extend, ident_path, parent_path, parent_row_id, _r_lvl)
+        ]
+        yield from self._iter_normalized_rows(stack)
 
     def _normalize_row(
         self,
@@ -284,15 +291,42 @@ class DataItemNormalizer(DataItemNormalizerBase[RelationalNormalizerConfig]):
         _r_lvl: int = 0,
         is_root: bool = False,
     ) -> TNormalizedRowIterator:
+        stack: List["_TraversalFrame"] = [
+            _RowFrame(
+                dict_row, extend, ident_path, parent_path, parent_row_id, pos, _r_lvl, is_root
+            )
+        ]
+        yield from self._iter_normalized_rows(stack)
+
+    def _process_row_frame(
+        self, frame: "_RowFrame"
+    ) -> Tuple[
+        Tuple[Tuple[str, Tuple[str, ...], Tuple[str, ...]], DictStrAny],
+        DictStrAny,
+        List["_TraversalFrame"],
+    ]:
+        """Flatten the row of `frame`, assign its id and build the frames of its child lists.
+
+        Returns the row to yield and the child frames (in traversal order) to push onto
+        the work stack when the caller decides to descend.
+        """
+        dict_row = frame.dict_row
+        ident_path = frame.ident_path
+        parent_path = frame.parent_path
+        parent_row_id = frame.parent_row_id
+        pos = frame.pos
+        r_lvl = frame.r_lvl
+        extend = frame.extend
+
         table = self._shorten_fragments(*parent_path, *ident_path)
         # flatten current row and extract all lists to recur into
-        flattened_row, lists = self._flatten(table, dict_row, _r_lvl)
+        flattened_row, lists = self._flatten(table, dict_row, r_lvl)
         # only extend row if there's something to extend
         if extend:
             flattened_row.update(extend)
 
         # identify load id if loaded data must be processed after loading incrementally
-        if is_root := is_root or not self._should_be_nested(table):
+        if is_root := frame.is_root or not self._should_be_nested(table):
             flattened_row[self.c_dlt_load_id] = self._load_id
 
         # infer record hash or leave existing primary key if present
@@ -301,28 +335,103 @@ class DataItemNormalizer(DataItemNormalizerBase[RelationalNormalizerConfig]):
             row_id = self._add_row_id(table, dict_row, flattened_row, parent_row_id, pos, is_root)
 
         # find fields to propagate to nested tables in config
+        child_extend = extend
         if self.propagation_config:
             propagated = self._get_propagated_values(table, flattened_row, is_root)
             if propagated:
-                extend = {**extend, **propagated} if extend else propagated
+                child_extend = {**extend, **propagated} if extend else propagated
 
-        # yield parent table first
-        should_descend = yield (table, parent_path, ident_path), flattened_row
-        if should_descend is False:
-            return
-
-        # normalize and yield lists - pre-compute parent path once
+        # build child list frames in traversal order; they are pushed onto a LIFO stack,
+        # so the caller reverses them before pushing
+        child_frames: List[_TraversalFrame] = []
         if lists:
             new_parent_path = parent_path + ident_path
             for list_path, list_content in lists.items():
-                yield from self._normalize_list(
-                    list_content,
-                    extend,
-                    list_path,
-                    new_parent_path,
-                    row_id,
-                    _r_lvl - 1,
+                child_frames.append(
+                    _ListFrame(
+                        list_content,
+                        child_extend,
+                        list_path,
+                        new_parent_path,
+                        row_id,
+                        r_lvl - 1,
+                    )
                 )
+
+        return (table, parent_path, ident_path), flattened_row, child_frames
+
+    def _iter_normalized_rows(self, stack: List["_TraversalFrame"]) -> TNormalizedRowIterator:
+        """Iteratively traverse nested rows using an explicit work stack.
+
+        Replaces the mutual recursion between `_normalize_row` and `_normalize_list`,
+        so arbitrarily deep nested arrays can be normalized regardless of the Python
+        recursion limit. The send protocol is unchanged: the value sent back after a
+        row is yielded decides whether that row's descendants are traversed.
+        """
+        shorten_fragments = self._shorten_fragments
+        should_be_nested = self._should_be_nested
+        c_value = self.c_value
+
+        while stack:
+            frame = stack.pop()
+            if isinstance(frame, _RowFrame):
+                row_info, flattened_row, child_frames = self._process_row_frame(frame)
+                # yield parent table first; the caller decides whether to descend
+                should_descend = yield row_info, flattened_row
+                if should_descend is not False and child_frames:
+                    # push in reverse so lists keep their original traversal order
+                    stack.extend(reversed(child_frames))
+                continue
+
+            # list frame: process the next element of the sequence
+            seq = frame.seq
+            idx = frame.next_idx
+            if idx >= len(seq):
+                # whole sequence consumed, drop the frame
+                continue
+            # keep the frame on top of the stack so the remaining elements are
+            # traversed once the subtree of the current element completes
+            frame.next_idx = idx + 1
+            stack.append(frame)
+            v = seq[idx]
+            # use type() for exact match - faster than isinstance()
+            v_type = type(v)
+            if v_type is dict:
+                stack.append(
+                    _RowFrame(
+                        v,
+                        frame.extend,
+                        frame.ident_path,
+                        frame.parent_path,
+                        frame.parent_row_id,
+                        idx,
+                        frame.r_lvl,
+                        False,
+                    )
+                )
+            elif v_type is list:
+                # to normalize lists of lists, we must create a tracking intermediary table
+                stack.append(
+                    _RowFrame(
+                        {"list": v},
+                        frame.extend,
+                        frame.ident_path,
+                        frame.parent_path,
+                        frame.parent_row_id,
+                        idx,
+                        frame.r_lvl - 1,
+                        False,
+                    )
+                )
+            else:
+                # found non-dict in seq, so wrap it
+                table = shorten_fragments(*frame.parent_path, *frame.ident_path)
+                is_root = not should_be_nested(table)
+                wrap_v: DictStrAny = {c_value: v}
+                if frame.extend:
+                    wrap_v.update(frame.extend)
+                self._add_row_id(table, wrap_v, wrap_v, frame.parent_row_id, idx, is_root)
+                yield (table, frame.parent_path, frame.ident_path), wrap_v
 
     def extend_schema(self, extend_tables: bool = True) -> None:
         """Extends Schema with normalizer-specific hints and settings.
@@ -422,13 +531,19 @@ class DataItemNormalizer(DataItemNormalizerBase[RelationalNormalizerConfig]):
         root_table_name = self._normalize_table_identifier(table_name)
         max_nesting = self._get_table_nesting_level(root_table_name, self.max_nesting)
 
-        yield from self._normalize_row(
-            item,
-            {},
-            (root_table_name,),
-            _r_lvl=max_nesting,  # we count backwards
-            is_root=True,
-        )
+        stack: List[_TraversalFrame] = [
+            _RowFrame(
+                item,
+                {},
+                (root_table_name,),
+                (),
+                None,
+                None,
+                max_nesting,  # we count backwards
+                True,
+            )
+        ]
+        yield from self._iter_normalized_rows(stack)
 
     @classmethod
     def ensure_this_normalizer(cls, norm_config: TJSONNormalizer) -> None:
