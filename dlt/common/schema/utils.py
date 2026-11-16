@@ -1085,6 +1085,47 @@ def get_root_table(tables: TSchemaTables, table_name: str) -> TTableSchema:
     return table
 
 
+def _index_tables_by_parent(tables: TSchemaTables) -> Dict[str, List[TTableSchema]]:
+    """Groups nested tables by their parent table name in a single pass over `tables`.
+
+    Parent-child links are taken from the `parent` hint of each table definition, sibling
+    tables keep the order in which they appear in `tables`. The index is rebuilt on every
+    call, so in-place changes to `tables` (relinked parents, renamed resources, replaced
+    entries) are visible to the next computation.
+    """
+    index: Dict[str, List[TTableSchema]] = {}
+    for candidate in tables.values():
+        if is_nested_table(candidate):
+            index.setdefault(candidate["parent"], []).append(candidate)
+    return index
+
+
+def _collect_nested_tables(
+    children_index: Dict[str, List[TTableSchema]],
+    table: TTableSchema,
+    max_nesting: Optional[int],
+    include_self: Optional[bool],
+) -> List[TTableSchema]:
+    """Collects `table` and its nested tables from `children_index`, ordered by ancestry:
+    a table is followed by its whole descendant branch before the next sibling branch.
+    """
+    chain: List[TTableSchema] = []
+
+    def _child(t: TTableSchema, current_level: int = 0) -> None:
+        if include_self or current_level > 0:
+            chain.append(t)
+
+        # Stop recursion if we've reached max nesting level
+        if max_nesting is not None and current_level >= max_nesting:
+            return
+
+        for child in children_index.get(t["name"], ()):
+            _child(child, current_level + 1)
+
+    _child(table)
+    return chain
+
+
 def get_nested_tables(
     tables: TSchemaTables,
     table_name: str,
@@ -1108,24 +1149,9 @@ def get_nested_tables(
     if table_name not in tables:
         return []
 
-    chain: List[TTableSchema] = []
-
-    def _child(t: TTableSchema, current_level: int = 0) -> None:
-        name = t["name"]
-
-        if include_self or current_level > 0:
-            chain.append(t)
-
-        # Stop recursion if we've reached max nesting level
-        if max_nesting is not None and current_level >= max_nesting:
-            return
-
-        for candidate in tables.values():
-            if is_nested_table(candidate) and candidate.get("parent") == name:
-                _child(candidate, current_level + 1)
-
-    _child(tables[table_name])
-    return chain
+    return _collect_nested_tables(
+        _index_tables_by_parent(tables), tables[table_name], max_nesting, include_self
+    )
 
 
 def group_tables_by_resource(
@@ -1135,11 +1161,13 @@ def group_tables_by_resource(
     If `pattern` is supplied, the result is filtered to only resource names matching the pattern.
     """
     result: Dict[str, List[TTableSchema]] = {}
+    # index nested tables once: a single pass over `tables` serves all the chains below
+    children_index = _index_tables_by_parent(tables)
     for table in tables.values():
         resource = table.get("resource")
         if resource and (pattern is None or pattern.match(resource)):
             resource_tables = result.setdefault(resource, [])
-            resource_tables.extend(get_nested_tables(tables, table["name"]))
+            resource_tables.extend(_collect_nested_tables(children_index, table, None, True))
     return result
 
 

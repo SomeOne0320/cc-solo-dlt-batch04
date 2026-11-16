@@ -747,6 +747,207 @@ def test_group_tables_by_resource(schema: Schema) -> None:
     }
 
 
+def test_get_nested_tables_order_and_identity() -> None:
+    """The chain lists a parent first, then its whole descendant branch, then the next
+    sibling branch. Siblings keep the order of the input mapping. Returned tables are the
+    same objects held by the input mapping, which is left unmodified."""
+    tables: Dict[str, Any] = {}
+    # siblings inserted out of name order on purpose
+    tables["root"] = utils.new_table("root", columns=[])
+    tables["z_child"] = utils.new_table("z_child", columns=[], parent_table_name="root")
+    tables["a_child"] = utils.new_table("a_child", columns=[], parent_table_name="root")
+    tables["z_grand"] = utils.new_table("z_grand", columns=[], parent_table_name="z_child")
+    tables["a_grand_2"] = utils.new_table("a_grand_2", columns=[], parent_table_name="a_child")
+    tables["a_grand_1"] = utils.new_table("a_grand_1", columns=[], parent_table_name="a_child")
+    snapshot = deepcopy(tables)
+
+    chain = utils.get_nested_tables(tables, "root")
+    assert [t["name"] for t in chain] == [
+        "root",
+        "z_child",
+        "z_grand",
+        "a_child",
+        "a_grand_2",
+        "a_grand_1",
+    ]
+    # the very objects from the input mapping are returned
+    assert all(t is tables[t["name"]] for t in chain)
+    # the input mapping is not modified
+    assert tables == snapshot
+
+    # max_nesting and include_self keep their meaning on the indexed walk
+    assert [
+        t["name"] for t in utils.get_nested_tables(tables, "root", max_nesting=1)
+    ] == ["root", "z_child", "a_child"]
+    assert [
+        t["name"] for t in utils.get_nested_tables(tables, "root", include_self=False)
+    ] == ["z_child", "z_grand", "a_child", "a_grand_2", "a_grand_1"]
+    assert utils.get_nested_tables(tables, "root", max_nesting=0, include_self=False) == []
+
+
+def test_get_nested_tables_reflects_in_place_mutations() -> None:
+    """Callers mutate the same mapping between computations: relink parents or replace
+    entries keeping the total count. Each computation must use the current `parent` hints."""
+    tables: Dict[str, Any] = {}
+    tables["root_a"] = utils.new_table("root_a", columns=[])
+    tables["root_b"] = utils.new_table("root_b", columns=[])
+    tables["child"] = utils.new_table("child", columns=[], parent_table_name="root_a")
+    tables["grand"] = utils.new_table("grand", columns=[], parent_table_name="child")
+
+    assert [t["name"] for t in utils.get_nested_tables(tables, "root_a")] == [
+        "root_a",
+        "child",
+        "grand",
+    ]
+    assert [t["name"] for t in utils.get_nested_tables(tables, "root_b")] == ["root_b"]
+
+    # relink the subtree to the other root in the same mapping
+    tables["child"]["parent"] = "root_b"
+    assert [t["name"] for t in utils.get_nested_tables(tables, "root_a")] == ["root_a"]
+    assert [t["name"] for t in utils.get_nested_tables(tables, "root_b")] == [
+        "root_b",
+        "child",
+        "grand",
+    ]
+
+    # delete one entry and add another, keeping the total table count
+    del tables["grand"]
+    tables["other"] = utils.new_table("other", columns=[], parent_table_name="root_a")
+    assert [t["name"] for t in utils.get_nested_tables(tables, "root_b")] == ["root_b", "child"]
+    assert [t["name"] for t in utils.get_nested_tables(tables, "root_a")] == ["root_a", "other"]
+
+
+def test_group_tables_by_resource_order_and_identity() -> None:
+    """Tables of a resource list the parent first, then its whole descendant branch, then the
+    next root of the same resource. Returned tables are the same objects held by the input
+    mapping, which is left unmodified."""
+    tables: Dict[str, Any] = {}
+    # two root tables owned by the same resource, siblings out of name order
+    tables["z_root"] = utils.new_table("z_root", columns=[], resource="r1")
+    tables["a_root"] = utils.new_table("a_root", columns=[], resource="r1")
+    tables["z_child"] = utils.new_table("z_child", columns=[], parent_table_name="z_root")
+    tables["a_child"] = utils.new_table("a_child", columns=[], parent_table_name="a_root")
+    tables["other"] = utils.new_table("other", columns=[], resource="r2")
+    snapshot = deepcopy(tables)
+
+    result = utils.group_tables_by_resource(tables)
+    assert list(result.keys()) == ["r1", "r2"]
+    assert [t["name"] for t in result["r1"]] == ["z_root", "z_child", "a_root", "a_child"]
+    assert [t["name"] for t in result["r2"]] == ["other"]
+    # the very objects from the input mapping are returned
+    assert all(t is tables[t["name"]] for t in result["r1"] + result["r2"])
+    assert tables == snapshot
+
+
+def test_group_tables_by_resource_keeps_nested_resource_entries() -> None:
+    """A nested table that carries its own `resource` hint is listed both in the chain of its
+    root and under its own resource, as before."""
+    tables: Dict[str, Any] = {}
+    tables["root"] = utils.new_table("root", columns=[], resource="r1")
+    tables["child"] = utils.new_table("child", columns=[], parent_table_name="root")
+    # unusual but possible: the ownership entry must be preserved
+    tables["child"]["resource"] = "r2"
+
+    result = utils.group_tables_by_resource(tables)
+    assert [t["name"] for t in result["r1"]] == ["root", "child"]
+    assert [t["name"] for t in result["r2"]] == ["child"]
+
+
+def test_group_tables_by_resource_reflects_in_place_mutations() -> None:
+    """Resource renames, relinked parents and replaced entries in the same mapping must be
+    visible to the next grouping."""
+    tables: Dict[str, Any] = {}
+    tables["root_a"] = utils.new_table("root_a", columns=[], resource="r1")
+    tables["root_b"] = utils.new_table("root_b", columns=[], resource="r2")
+    tables["child"] = utils.new_table("child", columns=[], parent_table_name="root_a")
+
+    result = utils.group_tables_by_resource(tables)
+    assert [t["name"] for t in result["r1"]] == ["root_a", "child"]
+    assert [t["name"] for t in result["r2"]] == ["root_b"]
+
+    # rename a resource and relink the parent in the same mapping
+    tables["root_b"]["resource"] = "r1"
+    tables["child"]["parent"] = "root_b"
+    result = utils.group_tables_by_resource(tables)
+    assert list(result.keys()) == ["r1"]
+    assert [t["name"] for t in result["r1"]] == ["root_a", "root_b", "child"]
+
+    # delete one entry and add another, keeping the total table count
+    del tables["child"]
+    tables["child_b"] = utils.new_table("child_b", columns=[], parent_table_name="root_b")
+    result = utils.group_tables_by_resource(tables)
+    assert [t["name"] for t in result["r1"]] == ["root_a", "root_b", "child_b"]
+
+
+class _VisitCountingTables(Dict[str, Any]):
+    """Counts table definitions yielded while iterating the mapping (i.e. full scans)."""
+
+    def __init__(self) -> None:
+        self.visits = 0
+        super().__init__()
+
+    def values(self) -> Any:  # type: ignore[override]
+        for value in super().values():
+            self.visits += 1
+            yield value
+
+    def items(self) -> Any:  # type: ignore[override]
+        for item in super().items():
+            self.visits += 1
+            yield item
+
+
+def _make_counting_tables(n_roots: int, n_details: int) -> _VisitCountingTables:
+    """`n_roots` root tables (one resource each) with `n_details` nested children per root."""
+    tables = _VisitCountingTables()
+    for r in range(n_roots):
+        root_name = f"root_{r}"
+        tables[root_name] = utils.new_table(root_name, columns=[], resource=f"resource_{r}")
+        for d in range(n_details):
+            child_name = f"{root_name}__child_{d}"
+            tables[child_name] = utils.new_table(
+                child_name, columns=[], parent_table_name=root_name
+            )
+    return tables
+
+
+def test_get_nested_tables_visits_scale_with_input() -> None:
+    """One root table with many details: collecting the chain is a single pass over the
+    input mapping, not one full scan per chain node."""
+    visits = []
+    for n_details in (100, 200):
+        tables = _make_counting_tables(1, n_details)
+        n = len(tables)
+        chain = utils.get_nested_tables(tables, "root_0")
+        assert len(chain) == n
+        # one indexing pass over the input: the old implementation scanned all tables
+        # once per chain node (n * n visits)
+        assert tables.visits <= 2 * n
+        visits.append(tables.visits)
+    # doubling input and output roughly doubles the visits (the old code quadrupled them)
+    assert visits[1] <= 2 * visits[0] + 2
+
+
+def test_group_tables_by_resource_visits_scale_with_input() -> None:
+    """The whole-list generation (also used to aggregate table ownership at load time) does
+    not rescan all tables for every resource chain."""
+    for n_roots, n_details in ((50, 2), (100, 2), (1, 150), (1, 300)):
+        tables = _make_counting_tables(n_roots, n_details)
+        n = len(tables)
+        grouped = utils.group_tables_by_resource(tables)
+        assert sum(len(chain) for chain in grouped.values()) == n
+        # one indexing pass + one grouping pass: the old implementation scanned all tables
+        # once per chain node of every resource
+        assert tables.visits <= 3 * n
+
+    # doubling input and output roughly doubles the visits (the old code quadrupled them)
+    small = _make_counting_tables(50, 2)
+    utils.group_tables_by_resource(small)
+    large = _make_counting_tables(100, 2)
+    utils.group_tables_by_resource(large)
+    assert large.visits <= 2 * small.visits + 2
+
+
 def test_remove_processing_hints() -> None:
     eth_V11 = load_yml_case("schemas/eth/ethereum_schema_v11")
     # here tables contain processing hints
